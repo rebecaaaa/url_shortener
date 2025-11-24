@@ -1,0 +1,45 @@
+swagger: "2.0"
+info:
+  title: "{{ api_name }}"
+schemes:
+  - "https"
+paths:
+  /shorten:
+    post:
+      summary: "Cria uma nova URL encurtada"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      security: [] 
+      responses:
+        "200":
+          description: "URL encurtada criada com sucesso"
+      x-amazon-apigateway-integration:
+        type: "aws_proxy"
+        httpMethod: "POST"
+        uri: "arn:aws:apigateway:{{ aws_region }}:lambda:path/2015-03-31/functions/{{ create_lambda_info.configuration.function_arn }}/invocations"
+  
+  /{short_code}:
+    get:
+      summary: "Redireciona a URL encurtada"
+      produces:
+        - "application/json"
+      parameters:
+        - name: "short_code"
+          in: "path"
+          required: true
+          type: "string"
+      security: [] 
+      responses:
+        "302":
+          description: "Redirecionamento para a URL original"
+          headers:
+            Location:
+              type: "string"
+        "404":
+          description: "URL não encontrada"
+      x-amazon-apigateway-integration:
+        type: "aws_proxy"
+        httpMethod: "POST" 
+        uri: "arn:aws:apigateway:{{ aws_region }}:lambda:path/2015-03-31/functions/{{ redirect_lambda_info.configuration.function_arn }}/invocations"

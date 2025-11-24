@@ -1,0 +1,115 @@
+---
+- name: Provisionar Encurtador de URL Serverless
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    aws_region: {region}
+    aws_account_id: {account ID}
+    app_name: "url-shortener"
+
+    dynamodb_table_name: "{{ app_name }}-table"
+    iam_role_name: "{{ app_name }}-lambda-role"
+    api_name: "{{ app_name }}-api"
+
+   
+    create_lambda_name: "{{ app_name }}-create-link"
+    redirect_lambda_name: "{{ app_name }}-redirect-link"
+
+    source_code_path: "shortener_function.py"
+    zip_file_path: "/tmp/{{ app_name }}.zip"
+
+  tasks:
+    - name: 1. Criar a tabela no DynamoDB com 'short_code' como chave
+      community.aws.dynamodb_table:
+        name: "{{ dynamodb_table_name }}"
+        region: "{{ aws_region }}"
+        hash_key_name: "short_code" 
+        hash_key_type: "STRING"
+        billing_mode: "PAY_PER_REQUEST"
+        state: present
+
+    - name: 2. Criar IAM Role e Anexar Política de Logs
+      community.aws.iam_role:
+        name: "{{ iam_role_name }}"
+        region: "{{ aws_region }}"
+        assume_role_policy_document: "{{ lookup('file', 'lambda_trust_policy.json') }}"
+        managed_policy:
+          - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        state: present
+      register: lambda_role
+
+
+    - name: 4. Anexar política de acesso ao DynamoDB 
+      community.aws.iam_policy:
+        iam_type: role
+        iam_name: "{{ iam_role_name }}"
+        policy_name: "{{ app_name }}-dynamodb-policy"
+        policy_json: "{{ lookup('file', 'lambda_dynamodb_policy.json') | replace('TABLE_NAME', dynamodb_table_name) | replace('AWS_REGION', aws_region) | replace('AWS_ACCOUNT_ID', aws_account_id) }}"
+        state: present
+
+    - name: 5. Compactar o código da função em um arquivo .zip
+      community.general.archive:
+        path: "{{ source_code_path }}"
+        dest: "{{ zip_file_path }}"
+        format: zip
+
+    - name: '6. Criar a função Lambda 1 de 2: Criar Link' 
+      community.aws.lambda:
+        name: "{{ create_lambda_name }}"
+        region: "{{ aws_region }}"
+        zip_file: "{{ zip_file_path }}"
+        runtime: "python3.9"
+        handler: "shortener_function.create_link_handler"
+        role: "{{ lambda_role.iam_role.arn }}"
+        environment_variables:
+          TABLE_NAME: "{{ dynamodb_table_name }}"
+        state: present
+      register: create_lambda_info
+
+    - name: '7. Criar a função Lambda 2 de 2: Redirecionar Link' 
+      community.aws.lambda:
+        name: "{{ redirect_lambda_name }}"
+        region: "{{ aws_region }}"
+        zip_file: "{{ zip_file_path }}"
+        runtime: "python3.9"
+        handler: "shortener_function.redirect_link_handler"
+        role: "{{ lambda_role.iam_role.arn }}"
+        environment_variables:
+          TABLE_NAME: "{{ dynamodb_table_name }}"
+        state: present
+      register: redirect_lambda_info
+
+    - name: 8. Definir a API Gateway REST 
+      community.aws.api_gateway:
+        name: "{{ api_name }}"
+        region: "{{ aws_region }}"
+        state: present
+        swagger_text: "{{ lookup('template', 'swagger_template.yml.j2') }}"
+      register: api_gateway
+
+    - name: 9. Criar novo Deployment e Publicar no stage 'prod' (via AWS CLI)
+      ansible.builtin.command: >
+        aws apigateway create-deployment
+        --rest-api-id {{ api_gateway.api_id }}
+        --region {{ aws_region }}
+        --stage-name prod
+      changed_when: true
+
+    - name: '11. Conceder permissão 2 de 2 '
+      ansible.builtin.command: >
+        aws lambda add-permission
+        --function-name {{ redirect_lambda_name }}
+        --statement-id AllowAPIGatewayInvokeRedirect
+        --action lambda:InvokeFunction
+        --principal apigateway.amazonaws.com
+        --source-arn "arn:aws:execute-api:{{ aws_region }}:{{ aws_account_id }}:{{ api_gateway.api_id }}/*/*/*"
+        --region {{ aws_region }}
+      register: perm2
+      changed_when: "'StatementId' in perm2.stdout"
+      failed_when: perm2.rc != 0 and 'ResourceConflictException' not in perm2.stderr
+
+    - name: 12. Mostrar a URL final da API
+      ansible.builtin.debug:
+        msg: "Sucesso! API disponível em: https://{{ api_gateway.api_id }}.execute-api.{{ aws_region }}.amazonaws.com/prod"
